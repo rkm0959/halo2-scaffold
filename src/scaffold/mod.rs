@@ -10,16 +10,17 @@ use halo2_base::{
     gates::{
         builder::{
             CircuitBuilderStage, GateCircuitBuilder, GateThreadBuilder,
-            MultiPhaseThreadBreakPoints, RangeCircuitBuilder,
+            MultiPhaseThreadBreakPoints, RangeCircuitBuilder, SBOXCircuitBuilder, FlexGateConfigParams
         },
         flex_gate::FlexGateConfig,
+        sbox::SBOXConfig
     },
     halo2_proofs::{
         circuit::{Layouter, SimpleFloorPlanner},
         dev::MockProver,
         halo2curves::bn256::{Bn256, Fr, G1Affine},
         plonk::{
-            verify_proof, Circuit, Column, ConstraintSystem, Error, Instance, ProvingKey,
+            self, verify_proof, Circuit, Column, ConstraintSystem, Error, Instance, ProvingKey,
             VerifyingKey,
         },
         poly::{
@@ -218,6 +219,34 @@ where
             }
         };
 
+        // lmao we don't use range anyway, so...
+        set_var("USE_SBOX", "1");
+
+        let sbox: usize = var("USE_SBOX")
+            .map(|str| {
+                let lookup_bits = str.parse().unwrap();
+                // we use a lookup table with 2^LOOKUP_BITS rows. Due to blinding factors, we need a little more than 2^LOOKUP_BITS rows total in our circuit
+                assert!(lookup_bits < k, "LOOKUP_BITS needs to be less than DEGREE");
+                lookup_bits
+            })
+            .unwrap_or(0);
+        set_var("USE_SBOX", sbox.to_string());
+            
+        if sbox != 0 {
+            let circuit = match stage {
+                CircuitBuilderStage::Prover => SBOXCircuitBuilder::prover(
+                    builder,
+                    pinning.expect("Circuit pinning not found").break_points(),
+                ),
+                CircuitBuilderStage::Keygen => SBOXCircuitBuilder::keygen(builder),
+                CircuitBuilderStage::Mock => SBOXCircuitBuilder::mock(builder),
+            };
+            return ScaffoldCircuitBuilder::SBOX(SBOXWithInstanceCircuitBuilder::new(
+                circuit,
+                assigned_instances,
+            ));
+        }
+
         if lookup_bits != 0 {
             let circuit = match stage {
                 CircuitBuilderStage::Prover => RangeCircuitBuilder::prover(
@@ -252,11 +281,13 @@ where
 pub enum ScaffoldConfig<F: ScalarField> {
     Gate(GateWithInstanceConfig<F>),
     Range(RangeWithInstanceConfig<F>),
+    SBOX(SBOXWithInstanceConfig<F>)
 }
 
 pub enum ScaffoldCircuitBuilder<F: ScalarField> {
     Gate(GateWithInstanceCircuitBuilder<F>),
     Range(RangeWithInstanceCircuitBuilder<F>),
+    SBOX(SBOXWithInstanceCircuitBuilder<F>),
 }
 
 impl<F: ScalarField> Circuit<F> for ScaffoldCircuitBuilder<F> {
@@ -270,6 +301,11 @@ impl<F: ScalarField> Circuit<F> for ScaffoldCircuitBuilder<F> {
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
         let lookup_bits: usize =
             var("LOOKUP_BITS").unwrap_or_else(|_| "0".to_string()).parse().unwrap();
+        let sbox: usize =
+            var("USE_SBOX").unwrap_or_else(|_| "0".to_string()).parse().unwrap();
+        if sbox != 0 {
+            return ScaffoldConfig::SBOX(SBOXWithInstanceCircuitBuilder::configure(meta))
+        }
         if lookup_bits != 0 {
             ScaffoldConfig::Range(RangeWithInstanceCircuitBuilder::configure(meta))
         } else {
@@ -285,6 +321,9 @@ impl<F: ScalarField> Circuit<F> for ScaffoldCircuitBuilder<F> {
             (ScaffoldCircuitBuilder::Range(circuit), ScaffoldConfig::Range(config)) => {
                 circuit.synthesize(config, layouter)
             }
+            (ScaffoldCircuitBuilder::SBOX(circuit), ScaffoldConfig::SBOX(config)) => {
+                circuit.synthesize(config, layouter)
+            }
             _ => unreachable!(),
         }
     }
@@ -295,6 +334,7 @@ impl<F: ScalarField> CircuitExt<F> for ScaffoldCircuitBuilder<F> {
         match self {
             ScaffoldCircuitBuilder::Gate(circuit) => vec![circuit.assigned_instances.len()],
             ScaffoldCircuitBuilder::Range(circuit) => vec![circuit.assigned_instances.len()],
+            ScaffoldCircuitBuilder::SBOX(circuit) => vec![circuit.assigned_instances.len()],
         }
     }
 
@@ -304,6 +344,7 @@ impl<F: ScalarField> CircuitExt<F> for ScaffoldCircuitBuilder<F> {
                 vec![circuit.assigned_instances.iter().map(|v| *v.value()).collect()]
             }
             ScaffoldCircuitBuilder::Range(circuit) => circuit.instances(),
+            ScaffoldCircuitBuilder::SBOX(circuit) => vec![circuit.instance()],
         }
     }
 }
@@ -315,6 +356,9 @@ impl<F: ScalarField> PinnableCircuit<F> for ScaffoldCircuitBuilder<F> {
         match self {
             ScaffoldCircuitBuilder::Gate(circuit) => circuit.circuit.break_points.borrow().clone(),
             ScaffoldCircuitBuilder::Range(circuit) => {
+                circuit.circuit.0.break_points.borrow().clone()
+            }
+            ScaffoldCircuitBuilder::SBOX(circuit) => {
                 circuit.circuit.0.break_points.borrow().clone()
             }
         }
@@ -359,6 +403,112 @@ impl<F: ScalarField> Circuit<F> for GateWithInstanceCircuitBuilder<F> {
         // we later `take` the builder, so we need to save this value
         let witness_gen_only = self.circuit.builder.borrow().witness_gen_only();
         let assigned_advices = self.circuit.sub_synthesize(&config.gate, &[], &[], &mut layouter);
+
+        if !witness_gen_only {
+            // expose public instances
+            let mut layouter = layouter.namespace(|| "expose");
+            for (i, instance) in self.assigned_instances.iter().enumerate() {
+                let cell = instance.cell.unwrap();
+                let (cell, _) = assigned_advices
+                    .get(&(cell.context_id, cell.offset))
+                    .expect("instance not assigned");
+                layouter.constrain_instance(*cell, config.instance, i);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SBOXWithInstanceConfig<F: ScalarField> {
+    pub sbox: SBOXConfig<F>,
+    pub instance: Column<Instance>,
+}
+
+/// This is an extension of [`SBOXCircuitBuilder`] that adds support for public instances (aka public inputs+outputs)
+///
+/// The intended design is that a [`GateThreadBuilder`] is populated and then produces some assigned instances, which are supplied as `assigned_instances` to this struct.
+/// The [`Circuit`] implementation for this struct will then expose these instances and constrain them using the Halo2 API.
+#[derive(Clone, Debug)]
+pub struct SBOXWithInstanceCircuitBuilder<F: ScalarField> {
+    pub circuit: SBOXCircuitBuilder<F>,
+    pub assigned_instances: Vec<AssignedValue<F>>,
+}
+
+impl<F: ScalarField> SBOXWithInstanceCircuitBuilder<F> {
+    pub fn keygen(
+        builder: GateThreadBuilder<F>,
+        assigned_instances: Vec<AssignedValue<F>>,
+    ) -> Self {
+        Self { circuit: SBOXCircuitBuilder::keygen(builder), assigned_instances }
+    }
+
+    pub fn mock(builder: GateThreadBuilder<F>, assigned_instances: Vec<AssignedValue<F>>) -> Self {
+        Self { circuit: SBOXCircuitBuilder::mock(builder), assigned_instances }
+    }
+
+    pub fn prover(
+        builder: GateThreadBuilder<F>,
+        assigned_instances: Vec<AssignedValue<F>>,
+        break_points: MultiPhaseThreadBreakPoints,
+    ) -> Self {
+        Self { circuit: SBOXCircuitBuilder::prover(builder, break_points), assigned_instances }
+    }
+
+    pub fn new(circuit: SBOXCircuitBuilder<F>, assigned_instances: Vec<AssignedValue<F>>) -> Self {
+        Self { circuit, assigned_instances }
+    }
+
+    pub fn config(&self, k: u32, minimum_rows: Option<usize>) -> FlexGateConfigParams {
+        self.circuit.0.builder.borrow().config(k as usize, minimum_rows)
+    }
+
+    pub fn break_points(&self) -> MultiPhaseThreadBreakPoints {
+        self.circuit.0.break_points.borrow().clone()
+    }
+
+    pub fn instance_count(&self) -> usize {
+        self.assigned_instances.len()
+    }
+
+    pub fn instance(&self) -> Vec<F> {
+        self.assigned_instances.iter().map(|v| *v.value()).collect()
+    }
+}
+
+
+impl<F: ScalarField> Circuit<F> for SBOXWithInstanceCircuitBuilder<F> {
+    type Config = SBOXWithInstanceConfig<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        unimplemented!()
+    }
+
+    fn configure(meta: &mut plonk::ConstraintSystem<F>) -> Self::Config {
+        let sbox = SBOXCircuitBuilder::configure(meta);
+        let instance = meta.instance_column();
+        meta.enable_equality(instance);
+        SBOXWithInstanceConfig { sbox, instance }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), plonk::Error> {
+        // copied from RangeCircuitBuilder::synthesize but with extra logic to expose public instances
+        let sbox = config.sbox;
+        let circuit = &self.circuit.0;
+        sbox.load_lookup_table(&mut layouter).expect("load lookup table should not fail");
+        // we later `take` the builder, so we need to save this value
+        let witness_gen_only = circuit.builder.borrow().witness_gen_only();
+        let assigned_advices = circuit.sub_synthesize(
+            &sbox.gate,
+            &sbox.lookup_advice,
+            &sbox.q_lookup,
+            &mut layouter,
+        );
 
         if !witness_gen_only {
             // expose public instances
